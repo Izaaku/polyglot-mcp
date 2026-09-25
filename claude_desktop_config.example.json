@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "polyglot": {
+      "command": "python",
+      "args": ["C:\\Users\\izaak\\polyglot-mcp\\server.py"]
+    }
+  }
+}
