@@ -1,51 +1,38 @@
 """
 Motor de traducción de Polyglot Talk Tour, extraído como módulo reutilizable.
 
-Usa el mismo endpoint gratuito de Google Translate que la cascada de PTT
-(translate.googleapis.com/translate_a/single). No requiere API key ni el
-backend completo de Flask/Supabase: es una versión limpia y autónoma para
-poder envolverla con MCP y demostrarla.
+Estrategia de proveedores (robusta, misma filosofía que la cascada de PTT):
+  1. MyMemory (API pública, tolerante para volumen bajo)  -> PRINCIPAL
+  2. Google (endpoint gratuito) con reintento + backoff    -> RESPALDO
+Si ambos fallan, se lanza un error claro que nombra a los dos.
 
-Si algún día quieres apuntar el MCP server a tu backend real de PTT en vez
-de a este endpoint, solo cambias `translate()` por una llamada HTTP a tu API.
+Se prioriza MyMemory porque el endpoint gratuito de Google limita por IP
+(HTTP 429) cuando recibe muchas llamadas seguidas.
 """
 import json
+import time
 import urllib.parse
 import urllib.request
+import urllib.error
 
-_UA = {"User-Agent": "Mozilla/5.0 (compatible; PolyglotMCP/1.0)"}
+_UA = {"User-Agent": "Mozilla/5.0 (compatible; PolyglotMCP/1.2)"}
 
-# Idiomas soportados (subconjunto representativo de PTT). Código ISO -> nombre.
 LANGUAGES = {
-    "es": "Spanish",
-    "en": "English",
-    "fr": "French",
-    "de": "German",
-    "it": "Italian",
-    "pt": "Portuguese",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "zh-CN": "Chinese (Simplified)",
-    "zh-TW": "Chinese (Traditional)",
-    "ar": "Arabic",
-    "ru": "Russian",
-    "hi": "Hindi",
-    "nl": "Dutch",
-    "tr": "Turkish",
-    "pl": "Polish",
-    "vi": "Vietnamese",
-    "th": "Thai",
-    "id": "Indonesian",
-    "uk": "Ukrainian",
+    "es": "Spanish", "en": "English", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "ja": "Japanese", "ko": "Korean",
+    "zh-CN": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)",
+    "ar": "Arabic", "ru": "Russian", "hi": "Hindi", "nl": "Dutch",
+    "tr": "Turkish", "pl": "Polish", "vi": "Vietnamese", "th": "Thai",
+    "id": "Indonesian", "uk": "Ukrainian",
 }
+
+_RETRY_WAITS = (0.6, 1.4, 3.0)
 
 
 def _g_code(code: str) -> str:
-    """Normaliza códigos de idioma al formato que espera Google."""
     if not code:
         return "auto"
-    c = code.strip()
-    low = c.lower()
+    low = code.strip().lower()
     if low in ("zh", "zh-hans", "zh_cn", "zh-cn"):
         return "zh-CN"
     if low in ("zh-hant", "zh_tw", "zh-tw"):
@@ -53,62 +40,98 @@ def _g_code(code: str) -> str:
     return low
 
 
-def translate(text: str, target_lang: str, source_lang: str = "auto") -> str:
-    """Traduce `text` a `target_lang`. `source_lang='auto'` detecta el idioma.
+def _http_json(url: str, timeout: int = 10):
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
 
-    Devuelve el texto traducido. Lanza RuntimeError si la traducción falla.
-    """
-    if not text or not text.strip():
-        return ""
 
-    src = _g_code(source_lang)
-    tgt = _g_code(target_lang)
+# ---- Proveedor PRINCIPAL: MyMemory ----
+def _mymemory(text: str, src: str, tgt: str):
+    params = urllib.parse.urlencode({"q": text, "langpair": "%s|%s" % (src, tgt)})
+    url = "https://api.mymemory.translated.net/get?" + params
+    try:
+        data = _http_json(url)
+        if data.get("responseStatus") not in (200, "200", None):
+            return None
+        out = (data.get("responseData") or {}).get("translatedText")
+        if out and "MYMEMORY WARNING" not in out.upper():
+            return out
+        return None
+    except Exception:
+        return None
 
+
+# ---- Proveedor RESPALDO: Google (con reintento/backoff) ----
+def _google(text: str, src: str, tgt: str):
     params = urllib.parse.urlencode({
-        "client": "gtx",
-        "sl": src,
-        "tl": tgt,
-        "dt": "t",
-        "q": text,
+        "client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text,
     })
     url = "https://translate.googleapis.com/translate_a/single?" + params
+    last_err = None
+    for wait in (0.0,) + _RETRY_WAITS:
+        if wait:
+            time.sleep(wait)
+        try:
+            data = _http_json(url)
+            return "".join(seg[0] for seg in (data[0] or []) if seg and seg[0]), None
+        except urllib.error.HTTPError as e:
+            last_err = "HTTP %s" % e.code
+            if e.code not in (429, 500, 502, 503):
+                break
+        except Exception as e:
+            last_err = str(e)
+    return None, last_err
 
-    try:
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.load(resp)
-        # La respuesta es una lista anidada; los segmentos están en data[0].
-        segments = data[0] or []
-        return "".join(seg[0] for seg in segments if seg and seg[0])
-    except Exception as e:
-        raise RuntimeError(f"translation failed: {e}") from e
+
+def _heuristic_lang(text: str) -> str:
+    t = (text or "").lower()
+    if any(w in t for w in (" el ", " la ", " los ", " que ", " de ", " y ", "ñ", "¿", "¡", "á", "í", "ó", "ú")):
+        return "es"
+    return "en"
+
+
+def translate(text: str, target_lang: str, source_lang: str = "auto") -> str:
+    """Traduce `text` a `target_lang`. MyMemory (principal) -> Google (respaldo)."""
+    if not text or not text.strip():
+        return ""
+    tgt = _g_code(target_lang)
+    src = _g_code(source_lang)
+    src_resolved = src if src != "auto" else _heuristic_lang(text)
+
+    # 1) MyMemory (principal)
+    out = _mymemory(text, src_resolved, tgt)
+    if out:
+        return out
+
+    # 2) Google (respaldo, con reintento)
+    out, err = _google(text, src, tgt)
+    if out:
+        return out
+
+    raise RuntimeError(
+        "translation failed: MyMemory returned nothing and Google error was %s" % err
+    )
 
 
 def detect_language(text: str) -> str:
-    """Detecta el idioma de `text`. Devuelve un código ISO (p. ej. 'es', 'en')."""
+    """Detecta el idioma de `text`. Google con reintento; si falla, heurística es/en."""
     if not text or not text.strip():
         return "und"
-
     params = urllib.parse.urlencode({
-        "client": "gtx",
-        "sl": "auto",
-        "tl": "en",
-        "dt": "t",
-        "q": text,
+        "client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text,
     })
     url = "https://translate.googleapis.com/translate_a/single?" + params
-
-    try:
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.load(resp)
-        # El código detectado suele venir en data[2].
-        detected = data[2] if len(data) > 2 else None
-        return detected or "und"
-    except Exception as e:
-        raise RuntimeError(f"detection failed: {e}") from e
+    for wait in (0.0,) + _RETRY_WAITS:
+        if wait:
+            time.sleep(wait)
+        try:
+            data = _http_json(url)
+            return (data[2] if len(data) > 2 else None) or "und"
+        except Exception:
+            continue
+    return _heuristic_lang(text)
 
 
 def list_languages() -> dict:
-    """Devuelve el mapa de idiomas soportados (código ISO -> nombre en inglés)."""
     return dict(LANGUAGES)

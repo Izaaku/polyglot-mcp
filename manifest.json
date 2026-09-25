@@ -1,0 +1,32 @@
+{
+  "dxt_version": "0.1",
+  "name": "polyglot",
+  "display_name": "Polyglot MCP",
+  "version": "1.2.0",
+  "description": "Translation tools (translate, detect_language, list_languages) wrapping the Polyglot Talk Tour engine.",
+  "author": {
+    "name": "Isaak Uribe"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "python",
+      "args": ["${__dirname}/server.py"],
+      "env": {
+        "PYTHONPATH": "${__dirname}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "translate", "description": "Translate text into a target language" },
+    { "name": "detect_language", "description": "Detect the language of a piece of text" },
+    { "name": "list_languages", "description": "List the supported languages" }
+  ],
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}
