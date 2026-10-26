@@ -1,5 +1,7 @@
 # Polyglot MCP
 
+![CI](https://github.com/Izaaku/polyglot-mcp/actions/workflows/ci.yml/badge.svg)
+
 An **MCP (Model Context Protocol) server** that exposes the translation engine
 from [Polyglot Talk Tour](https://polyglot-talk.fly.dev/tour) as tools that any
 AI model — Claude Desktop, Cursor, or a custom agent — can discover and call on
@@ -78,6 +80,16 @@ mcp dev server.py     # opens the MCP Inspector to call the tools by hand
                                                    │ (PTT engine)     │
                                                    └──────────────────┘
 ```
+
+## Tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+The suite monkeypatches the network out, so it runs offline and fast. CI runs it
+on Python 3.10–3.12 via GitHub Actions on every push and pull request.
 
 ## License
 
